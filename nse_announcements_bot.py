@@ -13,13 +13,10 @@ from telegram.constants import ParseMode
 # ==========================================
 # CONFIGURATION & ENVIRONMENT VARIABLES
 # ==========================================
-# Reads credentials directly from Render Environment Variables
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Polling interval in seconds (300 seconds = 5 minutes)
 CHECK_INTERVAL_SECONDS = 300
-
 STATE_FILE = "sent_announcements.json"
 
 NSE_HOME_URL = "https://www.nseindia.com"
@@ -31,7 +28,6 @@ USER_AGENT = (
     "Chrome/128.0.0.0 Safari/537.36"
 )
 
-# Logging configuration for Render console
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -50,7 +46,6 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"NSE Telegram Bot is running OK.")
 
     def log_message(self, format, *args):
-        # Suppress routine health check HTTP logs from spamming output
         return
 
 def start_health_server():
@@ -78,7 +73,6 @@ def load_sent_ids() -> Set[str]:
 def save_sent_ids(sent_ids: Set[str]) -> None:
     """Save sent announcement IDs to local state file."""
     try:
-        # Keep only the latest 2000 IDs to conserve memory
         truncated_ids = list(sent_ids)[-2000:]
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(truncated_ids, f, indent=2)
@@ -90,28 +84,50 @@ def save_sent_ids(sent_ids: Set[str]) -> None:
 # ==========================================
 async def get_nse_cookies() -> Dict[str, str]:
     """
-    Launches headless Chromium via Playwright to visit the NSE homepage,
-    bypasses Akamai protections, and extracts valid session cookies.
+    Launches headless Chromium via Playwright with HTTP/2 disabled to bypass
+    NSE Akamai CDN protocol resets and harvest session cookies.
     """
     logging.info("Harvesting fresh session cookies from NSE India...")
     cookies_dict = {}
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox"]
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-http2",  # Bypasses ERR_HTTP2_PROTOCOL_ERROR
+                "--disable-blink-features=AutomationControlled",
+                "--ignore-certificate-errors",
+            ]
         )
+        
         context = await browser.new_context(
             user_agent=USER_AGENT,
             viewport={"width": 1920, "height": 1080},
             extra_http_headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Sec-Ch-Ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"Windows"',
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+                "Upgrade-Insecure-Requests": "1"
             }
         )
+        
         page = await context.new_page()
         
         try:
-            response = await page.goto(NSE_HOME_URL, wait_until="domcontentloaded", timeout=60000)
+            response = await page.goto(
+                NSE_HOME_URL, 
+                wait_until="networkidle", 
+                timeout=60000
+            )
+            
             if response and response.status == 200:
                 await page.wait_for_timeout(3000)
                 cookies = await context.cookies()
@@ -121,6 +137,7 @@ async def get_nse_cookies() -> Dict[str, str]:
             else:
                 status_code = response.status if response else "No Response"
                 logging.error(f"Failed to load NSE homepage. HTTP Status: {status_code}")
+                
         except Exception as e:
             logging.error(f"Playwright navigation error: {e}")
         finally:
@@ -199,7 +216,6 @@ async def main_loop():
         logging.error("CRITICAL: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing from Environment Variables!")
         return
 
-    # Start background HTTP server in a separate thread for Render health checks
     threading.Thread(target=start_health_server, daemon=True).start()
 
     logging.info("Starting NSE Announcements Monitor Bot on Render...")
@@ -209,7 +225,6 @@ async def main_loop():
 
     while True:
         try:
-            # Refresh session cookies if empty
             if not cookies:
                 cookies = await get_nse_cookies()
                 if not cookies:
@@ -220,14 +235,12 @@ async def main_loop():
             logging.info("Checking for new corporate announcements...")
             announcements = await fetch_corporate_announcements(cookies)
 
-            # Reset cookies if payload is empty or 403 occurred
             if not announcements and cookies:
                 logging.info("Session invalid or empty payload received. Resetting cookies.")
                 cookies = {}
                 await asyncio.sleep(10)
                 continue
 
-            # Process entries in chronological order (oldest first)
             new_entries_count = 0
             for item in reversed(announcements):
                 seq_id = str(item.get("seqId", f"{item.get('symbol')}_{item.get('an_dt')}"))
@@ -240,7 +253,6 @@ async def main_loop():
                         sent_ids.add(seq_id)
                         save_sent_ids(sent_ids)
                         new_entries_count += 1
-                        # Rate limit delay between Telegram messages
                         await asyncio.sleep(1.5)
 
             logging.info(f"Check completed. Sent {new_entries_count} new announcements.")
