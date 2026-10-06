@@ -1,3 +1,25 @@
+import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+# Simple HTTP Server Handler for Render Health Checks
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"NSE Telegram Bot is active.")
+
+    def log_message(self, format, *args):
+        return  # Suppress HTTP health check logging
+
+def start_dummy_server():
+    port = int(os.getenv("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
+
+# Inside your main_loop() or script entry point, start the thread:
+# threading.Thread(target=start_dummy_server, daemon=True).start()
 import asyncio
 import json
 import logging
