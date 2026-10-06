@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+venv/
+.env
+sent_announcements.json
+.DS_Store
