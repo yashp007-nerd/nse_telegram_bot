@@ -4,6 +4,8 @@ import logging
 import os
 from typing import Dict, List, Set
 import httpx
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
 from playwright.async_api import async_playwright
 from telegram import Bot
 from telegram.constants import ParseMode
@@ -11,13 +13,10 @@ from telegram.constants import ParseMode
 # ==========================================
 # CONFIGURATION & ENVIRONMENT VARIABLES
 # ==========================================
-# Fetches credentials directly from Render's Environment Variables
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Polling interval in seconds (300 seconds = 5 minutes)
 CHECK_INTERVAL_SECONDS = 300
-
 STATE_FILE = "sent_announcements.json"
 
 NSE_HOME_URL = "https://www.nseindia.com"
@@ -29,18 +28,33 @@ USER_AGENT = (
     "Chrome/128.0.0.0 Safari/537.36"
 )
 
-# Logging setup for Render output console
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler()]
 )
 
+# Dummy HTTP server to satisfy Render Web Service health checks
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"NSE Bot is running.")
+
+    def log_message(self, format, *args):
+        return  # Suppress health check HTTP logs
+
+def start_dummy_server():
+    port = int(os.getenv("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    logging.info(f"Started dummy HTTP server on port {port} for Render health checks.")
+    server.serve_forever()
+
 # ==========================================
-# STATE MANAGEMENT (DEDUPLICATION)
+# STATE MANAGEMENT
 # ==========================================
 def load_sent_ids() -> Set[str]:
-    """Load previously processed announcement IDs to avoid duplicates."""
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -52,9 +66,7 @@ def load_sent_ids() -> Set[str]:
     return set()
 
 def save_sent_ids(sent_ids: Set[str]) -> None:
-    """Save processed announcement IDs to local state file."""
     try:
-        # Retain latest 2,000 entries to maintain low memory usage
         truncated_ids = list(sent_ids)[-2000:]
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(truncated_ids, f, indent=2)
@@ -65,14 +77,9 @@ def save_sent_ids(sent_ids: Set[str]) -> None:
 # NSE SESSION & SCRAPING ENGINE
 # ==========================================
 async def get_nse_cookies() -> Dict[str, str]:
-    """
-    Launches headless Chromium via Playwright, opens NSE homepage,
-    bypasses Akamai bot detection, and harvests fresh session cookies.
-    """
     logging.info("Harvesting fresh session cookies from NSE India...")
     cookies_dict = {}
     async with async_playwright() as p:
-        # Launch Chromium inside Docker container
         browser = await p.chromium.launch(
             headless=True,
             args=["--no-sandbox", "--disable-setuid-sandbox"]
@@ -90,7 +97,7 @@ async def get_nse_cookies() -> Dict[str, str]:
         try:
             response = await page.goto(NSE_HOME_URL, wait_until="domcontentloaded", timeout=60000)
             if response and response.status == 200:
-                await page.wait_for_timeout(3000)  # Brief pause for cookie setting
+                await page.wait_for_timeout(3000)
                 cookies = await context.cookies()
                 for cookie in cookies:
                     cookies_dict[cookie["name"]] = cookie["value"]
@@ -106,9 +113,6 @@ async def get_nse_cookies() -> Dict[str, str]:
     return cookies_dict
 
 async def fetch_corporate_announcements(cookies: Dict[str, str]) -> List[Dict]:
-    """
-    Queries NSE internal JSON API using session cookies obtained from Playwright.
-    """
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "*/*",
@@ -122,17 +126,16 @@ async def fetch_corporate_announcements(cookies: Dict[str, str]) -> List[Dict]:
         if response.status_code == 200:
             return response.json()
         elif response.status_code == 403:
-            logging.warning("Received 403 Forbidden. Session cookies have expired.")
+            logging.warning("Received 403 Forbidden. Session cookies expired.")
             return []
         else:
-            logging.error(f"NSE API returned HTTP status code: {response.status_code}")
+            logging.error(f"NSE API returned status code: {response.status_code}")
             return []
 
 # ==========================================
 # TELEGRAM FORMATTING & NOTIFICATIONS
 # ==========================================
 def format_telegram_message(item: Dict) -> str:
-    """Formats raw JSON entry into clean HTML styled for Telegram."""
     company_name = item.get("sm_name", item.get("symbol", "N/A"))
     symbol = item.get("symbol", "N/A")
     desc = item.get("desc", "N/A")
@@ -157,7 +160,6 @@ def format_telegram_message(item: Dict) -> str:
     return message
 
 async def send_telegram_notification(bot: Bot, message: str) -> bool:
-    """Sends the formatted alert to Telegram."""
     try:
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
@@ -175,8 +177,11 @@ async def send_telegram_notification(bot: Bot, message: str) -> bool:
 # ==========================================
 async def main_loop():
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.error("CRITICAL: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing from Environment Variables!")
+        logging.error("CRITICAL: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing!")
         return
+
+    # Start dummy server thread to pass Render Web Service port check
+    threading.Thread(target=start_dummy_server, daemon=True).start()
 
     logging.info("Starting NSE Announcements Monitor Bot on Render...")
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -185,7 +190,6 @@ async def main_loop():
 
     while True:
         try:
-            # Refresh cookies if missing/expired
             if not cookies:
                 cookies = await get_nse_cookies()
                 if not cookies:
@@ -196,14 +200,12 @@ async def main_loop():
             logging.info("Checking for new corporate announcements...")
             announcements = await fetch_corporate_announcements(cookies)
 
-            # If 403 or empty data occurs, trigger fresh cookie harvest next loop
             if not announcements and cookies:
-                logging.info("Session invalid or empty payload received. Resetting cookies.")
+                logging.info("Session invalid or empty payload. Resetting cookies.")
                 cookies = {}
                 await asyncio.sleep(10)
                 continue
 
-            # Process announcements in chronological order (oldest first)
             new_entries_count = 0
             for item in reversed(announcements):
                 seq_id = str(item.get("seqId", f"{item.get('symbol')}_{item.get('an_dt')}"))
@@ -216,7 +218,6 @@ async def main_loop():
                         sent_ids.add(seq_id)
                         save_sent_ids(sent_ids)
                         new_entries_count += 1
-                        # Short delay between consecutive messages to comply with Telegram rate limits
                         await asyncio.sleep(1.5)
 
             logging.info(f"Check completed. Sent {new_entries_count} new announcements.")
