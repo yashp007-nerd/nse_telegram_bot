@@ -46,7 +46,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"NSE Telegram Bot is running OK.")
 
     def log_message(self, format, *args):
-        return
+        return  # Suppress HTTP health log spam
 
 def start_health_server():
     """Binds to the port assigned by Render (defaults to 10000)."""
@@ -216,6 +216,7 @@ async def main_loop():
         logging.error("CRITICAL: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing from Environment Variables!")
         return
 
+    # Start background HTTP server thread for Render health checks
     threading.Thread(target=start_health_server, daemon=True).start()
 
     logging.info("Starting NSE Announcements Monitor Bot on Render...")
@@ -225,6 +226,16 @@ async def main_loop():
 
     while True:
         try:
+            # Ping self using Render's automatically injected URL to prevent service sleeping
+            render_url = os.getenv("RENDER_EXTERNAL_URL")
+            if render_url:
+                try:
+                    async with httpx.AsyncClient() as client:
+                        await client.get(render_url, timeout=10.0)
+                    logging.info("Self-ping successful. Service kept awake.")
+                except Exception as ping_err:
+                    logging.warning(f"Self-ping failed: {ping_err}")
+
             if not cookies:
                 cookies = await get_nse_cookies()
                 if not cookies:
