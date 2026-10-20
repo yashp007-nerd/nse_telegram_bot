@@ -1,14 +1,18 @@
 import asyncio
+import io
 import json
 import logging
 import os
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 import httpx
+from pypdf import PdfReader
 from playwright.async_api import async_playwright
 from telegram import Bot
 from telegram.constants import ParseMode
+from google import genai
+from google.genai import types as genai_types
 
 # ==========================================
 # CONFIGURATION & ENVIRONMENT VARIABLES
@@ -21,6 +25,45 @@ STATE_FILE = "sent_announcements.json"
 
 NSE_HOME_URL = "https://www.nseindia.com"
 NSE_API_URL = "https://www.nseindia.com/api/corporate-announcements?index=equities"
+NSE_PDF_BASE_URL = "https://archives.nseindia.com/corporate/"
+
+# Gemini AI Configuration
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = "gemini-2.0-flash"
+PDF_MAX_CHARS = 15000  # Trim very large PDFs to stay within token limits
+
+GEMINI_PROMPT_TEMPLATE = """You are a sharp financial analyst reviewing an NSE (National Stock Exchange of India) corporate filing.
+Analyze the following document text and extract the most valuable insights for a retail investor.
+
+Return your analysis in this exact HTML format (Telegram-compatible):
+
+<b>🧠 AI Insights</b>
+
+<b>📋 Summary:</b>
+[2-3 sentence plain-English summary of what this filing is about]
+
+<b>🔑 Key Points:</b>
+• [Point 1]
+• [Point 2]
+• [Point 3 — add more if needed]
+
+<b>💰 Financial Highlights:</b>
+• [Any revenue, profit, EPS, dividend amounts, or financial ratios mentioned — or "None mentioned"]
+
+<b>📅 Important Dates:</b>
+• [Record dates, board meeting dates, AGM dates, etc. — or "None mentioned"]
+
+<b>⚠️ Watch Out:</b>
+• [Any risks, litigations, regulatory issues, or red flags — or "None identified"]
+
+<b>🎯 Investor Takeaway:</b>
+[One concise sentence on what this means for investors]
+
+Document text:
+---
+{pdf_text}
+---"""
+
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -166,6 +209,83 @@ async def fetch_corporate_announcements(cookies: Dict[str, str]) -> List[Dict]:
             logging.error(f"NSE API returned status code: {response.status_code}")
             return []
 
+
+# ==========================================
+# PDF DOWNLOAD & TEXT EXTRACTION
+# ==========================================
+async def download_pdf(attachment_path: str) -> Optional[bytes]:
+    """Downloads a PDF from NSE's archive server. Returns raw bytes or None on failure."""
+    url = f"{NSE_PDF_BASE_URL}{attachment_path}"
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Referer": "https://www.nseindia.com/",
+    }
+    try:
+        async with httpx.AsyncClient(headers=headers, timeout=30.0, follow_redirects=True) as client:
+            response = await client.get(url)
+            if response.status_code == 200 and "pdf" in response.headers.get("content-type", "").lower():
+                logging.info(f"Downloaded PDF ({len(response.content):,} bytes) from {url}")
+                return response.content
+            else:
+                logging.warning(f"PDF download failed for {url} — HTTP {response.status_code}")
+                return None
+    except Exception as e:
+        logging.error(f"PDF download exception for {url}: {e}")
+        return None
+
+
+def extract_pdf_text(pdf_bytes: bytes) -> str:
+    """Extracts plain text from a PDF byte stream using pypdf. Returns empty string on failure."""
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        pages_text = []
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                pages_text.append(text.strip())
+        full_text = "\n\n".join(pages_text)
+        logging.info(f"Extracted {len(full_text):,} characters from PDF ({len(reader.pages)} pages).")
+        return full_text
+    except Exception as e:
+        logging.error(f"PDF text extraction error: {e}")
+        return ""
+
+
+async def generate_insights(pdf_text: str) -> Optional[str]:
+    """
+    Sends extracted PDF text to Gemini 2.0 Flash and returns a Telegram-ready
+    HTML insight block. Returns None if the API call fails or key is missing.
+    """
+    if not GEMINI_API_KEY:
+        logging.warning("GEMINI_API_KEY not set. Skipping AI insight generation.")
+        return None
+
+    # Trim text to avoid exceeding context limits
+    trimmed_text = pdf_text[:PDF_MAX_CHARS]
+    if len(pdf_text) > PDF_MAX_CHARS:
+        trimmed_text += "\n\n[... document truncated for analysis ...]"
+
+    prompt = GEMINI_PROMPT_TEMPLATE.format(pdf_text=trimmed_text)
+
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                temperature=0.2,
+                max_output_tokens=1024,
+            )
+        )
+        insight_text = response.text.strip()
+        logging.info("Gemini insight generated successfully.")
+        return insight_text
+    except Exception as e:
+        logging.error(f"Gemini API error: {e}")
+        return None
+
+
 # ==========================================
 # TELEGRAM FORMATTING & NOTIFICATIONS
 # ==========================================
@@ -264,7 +384,23 @@ async def main_loop():
                         sent_ids.add(seq_id)
                         save_sent_ids(sent_ids)
                         new_entries_count += 1
+
+                        # --- PDF Insight Pipeline ---
+                        attachment_path = item.get("attachment", "")
+                        if attachment_path:
+                            pdf_bytes = await download_pdf(attachment_path)
+                            if pdf_bytes:
+                                pdf_text = extract_pdf_text(pdf_bytes)
+                                if pdf_text and len(pdf_text) > 100:
+                                    insight = await generate_insights(pdf_text)
+                                    if insight:
+                                        await send_telegram_notification(bot, insight)
+                                else:
+                                    logging.info(f"PDF for seqId {seq_id} yielded no extractable text (may be scanned image).")
+                        # ----------------------------
+
                         await asyncio.sleep(1.5)
+
 
             logging.info(f"Check completed. Sent {new_entries_count} new announcements.")
 
